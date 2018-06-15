@@ -1,0 +1,60 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <DHTesp.h>
+#include <ESPAsyncWebServer.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <SPIFFSEditor.h>
+
+DHTesp dht;
+//WiFiServer server(80);
+AsyncWebServer server(80);
+
+char buff[256];
+char scanBuff[256];
+
+void connect()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  Serial.printf("MAC address: %s\n\r", WiFi.macAddress().c_str());
+  Serial.print("Connecting to WiFi");
+  WiFi.begin("zzi-net", "smarthomeiot2018");
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.printf("Local IP: %s\n\r", WiFi.localIP().toString().c_str());
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  Serial.println("DHT22 Test v1.0");
+  Serial.println("Booting");
+  dht.setup(4);
+
+  connect();
+ 
+  SPIFFS.begin(true);  
+  server.addHandler(new SPIFFSEditor(SPIFFS, "admin","admin"));
+  server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.html");
+
+  server.on("/test", HTTP_GET, [](AsyncWebServerRequest *request){
+    delay(dht.getMinimumSamplingPeriod());
+    auto humidity = dht.getHumidity();
+    auto temperature = dht.getTemperature();
+    sprintf(buff, "t=%0.2fC h=%0.2f%%", temperature, humidity);
+    request->send(200, "text/plain", String(buff));
+  });
+
+  server.begin();
+  Serial.printf("Server started. Use link http://%s/\n\r", WiFi.localIP().toString().c_str());
+
+}
+void loop()
+{
+}

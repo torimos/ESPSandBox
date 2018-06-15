@@ -1,0 +1,191 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <HTTPClient.h>
+#include <ESPAsyncWebServer.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <SPIFFSEditor.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <esp_wps.h>
+#include <esp_image_format.h>
+#include <algorithm>    // std::min
+
+
+const char* host = "esp32webupdate";
+const char* ssid = "zzi-net";
+const char* password = "smarthomeiot2018";
+
+AsyncWebServer server(80);
+
+int updateState = 0;
+
+// use first channel of 16 channels (started from zero)
+#define LEDC_CHANNEL_0     0
+// use 13 bit precission for LEDC timer
+#define LEDC_TIMER_13_BIT  13
+// use 5000 Hz as a LEDC base frequency
+#define LEDC_BASE_FREQ     5000
+// fade LED PIN (replace with LED_BUILTIN constant for built-in LED)
+#define LED_PIN            2
+int brightness = 0;    // how bright the LED is
+int fadeAmount = 5;    // how many points to fade the LED by
+long timeout = 0;
+
+// Arduino like analogWrite
+// value has to be between 0 and valueMax
+void ledcAnalogWrite(uint8_t channel, uint32_t value, uint32_t valueMax = 255) {
+  // calculate duty, 8191 from 2 ^ 13 - 1
+  uint32_t duty = (8191 / valueMax) * std::min(value, valueMax);
+
+  // write duty to LEDC
+  ledcWrite(channel, duty);
+}
+
+void setup(void){
+    Serial.begin(115200);
+    ledcSetup(LEDC_CHANNEL_0, LEDC_BASE_FREQ, LEDC_TIMER_13_BIT);
+    ledcAttachPin(LED_PIN, LEDC_CHANNEL_0);
+
+    // Connect to WiFi network
+    WiFi.begin(ssid, password);
+    Serial.println("ESP32 Web OTA Update v1.0b");
+    Serial.printf("Chip Rev: %d\n\r",ESP.getChipRevision());
+    Serial.printf("SDK: %s\n\r",ESP.getSdkVersion());
+    Serial.printf("CPU: %d MHz\n\r",ESP.getCpuFreqMHz());
+    Serial.printf("Heap: %d\n\r",ESP.getFreeHeap());
+    Serial.print("Booting");
+    // Wait for connection
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("");
+    Serial.print("Connected to ");
+    Serial.println(ssid);
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    /*use mdns for host name resolution*/
+    if (!MDNS.begin(host)) {
+        Serial.println("Error setting up MDNS responder!");
+        while(1) {
+            delay(1000);
+        }
+    }
+    Serial.println("mDNS responder started");
+
+    SPIFFS.begin(true);  
+    server.addHandler(new SPIFFSEditor(SPIFFS, "admin","admin"));
+
+    server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.html");
+    server.on("/led", HTTP_POST, 
+      [](AsyncWebServerRequest *request){
+        // for(int i=0;i<request->params();i++){
+        //   AsyncWebParameter* p = request->getParam(i);
+        //   if (p->name() == "value") {
+        //     brightness = p->value().toInt()%256;
+        //   }
+        // }
+        brightness = request->getParam(0)->value().toInt()%256;
+        request->send(200);
+      });
+    server.on("/update", HTTP_POST, 
+      [](AsyncWebServerRequest *request){
+        bool fail = (Update.hasError() || updateState < 0); 
+        AsyncWebServerResponse *response = request->beginResponse(fail?500:200, "text/plain", fail?"FAIL":"OK");
+        response->addHeader("Connection","close");
+        request->send(response);
+        auto timeout = millis() + 500;
+        while(millis()<=timeout)
+        {
+          delay(1);
+        }
+        esp_wifi_wps_disable();
+        ESP.restart();
+      }, 
+      [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){
+        if (len == 0)
+          updateState = -1;
+
+        if(!index) {
+          updateState = 0;
+          Serial.printf("Starting firmware update: %s\n\r", filename.c_str());
+          if (data[0] == ESP_IMAGE_HEADER_MAGIC) {
+            //start with max available size
+            if(!Update.begin(UPDATE_SIZE_UNKNOWN)){
+              Serial.println("Firmware update error");
+              Update.printError(Serial);
+              updateState = -1;
+            }
+          }
+          else {
+            // AsyncWebServerResponse *response = request->beginResponse(500, "text/plain", "FAIL");
+            // response->addHeader("Connection","close");
+            // request->send(response);
+            updateState = -1;
+          }
+        }
+        if (updateState<0)
+          return;
+         /* flashing firmware to ESP*/
+        if(Update.write(data, len) != len){
+          Serial.println("Firmware update error");
+          Update.printError(Serial);
+          updateState = -1;
+        }
+        else {
+          Serial.printf("Progress: %u\r", index+len);
+        }
+        if (final) {
+          Serial.println();
+          if(Update.end(true)){ //true to set the size to the current progress
+            Serial.printf("Update Success: %u\n\rRebooting...\n\r", (index+len));
+          } else {
+            Serial.println("Firmware update error");
+            Update.printError(Serial);
+            updateState = -1;
+          }
+        }
+      });
+    server.begin();
+
+    // esp_sleep_enable_timer_wakeup(30 * 1000000);
+    // esp_deep_sleep_start();
+}
+
+void loop(void){
+
+  // set the brightness on LEDC channel 0
+  ledcAnalogWrite(LEDC_CHANNEL_0, brightness);
+
+  if (millis() > timeout)
+  {
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String payload;
+      StaticJsonBuffer<256> jsonBuffer;
+      
+      http.begin("http://192.168.0.199:1880/events");
+      http.addHeader("Content-Type", "application/json");
+      
+      JsonObject &root = jsonBuffer.createObject();
+      root["type"] = 1;
+      root["value"] = hallRead();
+      root.prettyPrintTo(payload);
+
+      //Serial.printf("Posting event to server, payload: %s", payload.c_str());
+      int httpCode = http.POST(payload);
+      //String response = http.getString();
+      http.end();
+      if (httpCode != 200) {
+        Serial.printf("Status Code: %d. Respone: %s\n\r",httpCode, "...");
+      }
+    }
+    timeout = millis() + 1000;
+  }
+
+  delay(20);
+}
