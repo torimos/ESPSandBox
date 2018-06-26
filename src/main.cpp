@@ -1,100 +1,185 @@
-
-
 #include <Arduino.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncMqttClient.h>
-#include <ArduinoJson.h>
-#include "wifi/wifi.h"
-#include "ota/httpota.h"
-#include "led/led.h"
-#include <typeinfo>  //for 'typeid' to work  
-#include <string.h>  //for 'typeid' to work  
+#include <Wire.h>
+#include "BMP085.h"
+#include "ITG3200.h"
+#include "HMC5883L.h"
+#include "ADXL345.h"
 
-const char* host = "esp32webupdate";
-const char* ssid = "zzi-net";
-const char* password = "smarthomeiot2018";
-const char * mqttHost = "192.168.0.199";
 
-uint mqttPort = 1883;
-
-AsyncWebServer server(80);
-AsyncMqttClient mqttClient;
-
-long timeout = 0;
-bool power = false;
-uint prev_brightness = 1, brightness = 0;
-char dsn[32] = {};
-
-void onMqttConnect(bool sessionPresent) {
-    Serial.println("Connected to MQTT.");
-    mqttClient.subscribe("esp32/command", 0);
-}
-
-void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
-    Serial.println("Disconnected from MQTT.");
-}
-
-void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
-    auto v = String(topic);
-    if (v == "esp32/command")
-    {
-        Serial.println(payload);
-        StaticJsonBuffer<256> jsonBuffer;
-        JsonObject &root = jsonBuffer.parseObject(payload);
-        if (root.success()) {
-            brightness = root["led"];
-            power = root["power"];
-            prev_brightness = 0;
-        }
+void scan(){
+    Serial.println(" Scanning I2C Addresses");
+    uint8_t cnt=0;
+    for(uint8_t i=0;i<128;i++){
+    Wire.beginTransmission(i);
+    uint8_t ec=Wire.endTransmission(true);
+    if(ec==0){
+        if(i<16)Serial.print('0');
+        Serial.print(i,HEX);
+        cnt++;
     }
+    else Serial.print("..");
+    Serial.print(' ');
+    if ((i&0x0f)==0x0f)Serial.println();
+    }
+    Serial.print("Scan Completed, ");
+    Serial.print(cnt);
+    Serial.println(" I2C Devices found.");
 }
+
+ADXL345 accel;
+HMC5883L compass;
+ITG3200 gyro;
+BMP085 bmp(BMP085_ADDRESS);
+float t, p, a;
+int16_t x,y,z;
+int16_t ax,ay,az;
+const float maxg = 16000.0;
 
 void setup()
 {
     Serial.begin(115200);
-    led_init();
-    wifi_connect(ssid, password, host);
-    httpota_init(&server);
+    Wire.begin(22,21);
+    scan();
+    bmp.initialize();
+    gyro.initialize();
+    compass.initialize();
+    accel.initialize();
 
-    mqttClient.onConnect(onMqttConnect);
-    mqttClient.onDisconnect(onMqttDisconnect);
-    mqttClient.onMessage(onMqttMessage);
-    mqttClient.setServer(mqttHost, mqttPort);
-    mqttClient.connect();
+    if (!bmp.testConnection())
+        Serial.println("BMP error!");
+    if (!gyro.testConnection())
+        Serial.println("Gyro error!");
+    if (!compass.testConnection())
+        Serial.println("Compass error!");
+    if (!accel.testConnection())
+        Serial.println("Accelerometer error!");
 
-    uint64_t mac = ESP.getEfuseMac();
-    sprintf(dsn, "%04X%08X", (uint16_t)(mac>>32), (uint32_t)mac);
+    compass.setGain(HMC5883L_GAIN_1370);
+    compass.setMode(HMC5883L_MODE_CONTINUOUS);
+    compass.setDataRate(HMC5883L_RATE_15);
+    compass.setSampleAveraging(HMC5883L_AVERAGING_4);
+
+    accel.setRange(ADXL345_RANGE_2G);
 }
+
+void bmp_test()
+{
+    bmp.setControl(BMP085_MODE_TEMPERATURE);
+    t = bmp.getTemperatureC();
+    bmp.setControl(BMP085_MODE_PRESSURE_3);
+    p = bmp.getPressure();// * 0.0075006375541921;
+    a = bmp.getAltitude(p);
+    Serial.printf("B: Temp=%04.2f Alt=%04.2f Press=%04.2f \n\r", t, a, p);
+}
+
+void gyro_test()
+{
+    float t = gyro.getTemperature();
+    gyro.getRotation(&x,&y,&z);
+    Serial.printf("G: T=%4.0f %4.0f:%4.0f:%4.0f\n\r",t, 100.0 * ((float)x/maxg), 100.0 * ((float)y/maxg), 100.0 * ((float)z/maxg));
+}
+
+
+
+// No tilt compensation
+float noTiltCompensate(int x, int y, int z)
+{
+  float heading = atan2(y, x);
+  return heading;
+}
+ 
+// Tilt compensation
+float tiltCompensate(int x, int y, int z, int ax, int ay, int az)
+{
+  // Pitch & Roll 
+
+  float roll;
+  float pitch;
+
+  roll = asin(ay*0.004);
+  pitch = asin(-ax*0.004);
+
+  if (roll > 0.78 || roll < -0.78 || pitch > 0.78 || pitch < -0.78)
+  {
+    return -1000;
+  }
+
+  // Some of these are used twice, so rather than computing them twice in the algorithem we precompute them before hand.
+  float cosRoll = cos(roll);
+  float sinRoll = sin(roll);  
+  float cosPitch = cos(pitch);
+  float sinPitch = sin(pitch);
+
+  // Tilt compensation
+  float Xh = x * cosPitch + z * sinPitch;
+  float Yh = x * sinRoll * sinPitch + y * cosRoll - z * sinRoll * cosPitch;
+
+  float heading = atan2(Yh, Xh);
+
+  return heading;
+}
+// Correct angle
+float correctAngle(float heading)
+{
+  if (heading < 0) { heading += 2 * PI; }
+  if (heading > 2 * PI) { heading -= 2 * PI; }
+  return heading;
+}
+void compass_test()
+{
+    accel.getAcceleration(&ax,&ay,&az);
+    compass.getHeading(&x,&y,&z);
+    float heading1 = noTiltCompensate(x,y,z);
+    float heading2 = tiltCompensate(x,y,z, ax,ay,az);
+
+    if (heading2 == -1000)
+    {
+        heading2 = heading1;
+    }
+
+    // Set declination angle on your location and fix heading
+    // You can find your declination on: http://magnetic-declination.com/
+    // (+) Positive or (-) for negative
+    // For Bytom / Poland declination angle is 4'26E (positive)
+    // Formula: (deg + (min / 60.0)) / (180 / M_PI);
+    float declinationAngle = (4.0 + (26.0 / 60.0)) / (180 / M_PI);
+    heading1 += declinationAngle;
+    heading2 += declinationAngle;
+
+    // Correct for heading < 0deg and heading > 360deg
+    heading1 = correctAngle(heading1);
+    heading2 = correctAngle(heading2);
+
+    // Convert to degrees
+    heading1 = heading1 * 180/M_PI; 
+    heading2 = heading2 * 180/M_PI; 
+
+    Serial.printf("C: %3.2f %3.2f\n\r",heading1, heading2);
+}
+
+float fXg,fYg,fZg, pitch, roll;
+void accel_test(float alpha = 0.5)
+{
+    accel.getAcceleration(&ax, &ay, &az);
+ 
+    //Low Pass Filter
+    fXg = ax * alpha + (fXg * (1.0 - alpha));
+    fYg = ay * alpha + (fYg * (1.0 - alpha));
+    fZg = az * alpha + (fZg * (1.0 - alpha));
+ 
+    //Roll & Pitch Equations
+    roll  = (atan2(-fYg, fZg)*180.0)/M_PI;
+    pitch = (atan2(fXg, sqrt(fYg*fYg + fZg*fZg))*180.0)/M_PI;
+
+    Serial.printf("A: %4.1f %4.1f\n\r",pitch, roll);
+}
+
 
 void loop()
 {
-    if (!power)
-    {
-        led_write(0);
-    }
-    else if (prev_brightness != brightness)
-    {
-        led_write(brightness);
-        prev_brightness = brightness;
-    }
-
-    if (millis() > timeout)
-    {
-        if (mqttClient.connected())
-        { 
-            String payload;
-            StaticJsonBuffer<256> jsonBuffer;
-            JsonObject &root = jsonBuffer.createObject();
-            JsonObject &header = jsonBuffer.createObject();
-            JsonObject &body =  jsonBuffer.createObject();
-            root["header"] = header;
-            root["body"] = body;
-            header["dsn"] = dsn;
-            body["hall"] = hallRead();
-    
-            root.prettyPrintTo(payload);
-            mqttClient.publish("esp32/events", 0, true, payload.c_str());
-        }
-        timeout = millis() + 1000;
-    }
+    bmp_test();
+    gyro_test();
+    compass_test();
+    accel_test();
+    delay(100);
 }

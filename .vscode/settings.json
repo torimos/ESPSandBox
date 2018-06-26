@@ -17,7 +17,10 @@
         "limits": "cpp",
         "system_error": "cpp",
         "deque": "cpp",
-        "typeinfo": "cpp"
+        "typeinfo": "cpp",
+        "unordered_set": "cpp",
+        "*.tcc": "cpp",
+        "istream": "cpp"
     },
     "C_Cpp.intelliSenseEngineFallback": "Disabled",
     "C_Cpp.errorSquiggles": "Disabled"
